@@ -40,8 +40,9 @@ def main():
         lotado = check_limite(passageiros, limite)
 
         if parada_acionada():
-            if detectar_saida():
-                passageiros = atualizar_passageiros(passageiros, 2)
+            while check_parada():
+                if detectar_saida():
+                    passageiros = atualizar_passageiros(passageiros, 2)
 
 if __name__ == '__main_-':
     main()
