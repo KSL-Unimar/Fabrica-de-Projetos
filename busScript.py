@@ -11,9 +11,25 @@
 #   q = sair e mostrar o resumo
 #
 # O detector de pessoas fica no detector_passageiros.py.
+# A classificação de lotação fica no superlotacao.py e é enviada ao
+# servidor.py (API + dashboard + SQLite) pelo cliente_api.py.
+#
+# Uso:
+#   .venv/bin/python busScript.py                 # mostra a lista e pede o ônibus
+#   .venv/bin/python busScript.py --onibus onibus-01
+#   .venv/bin/python busScript.py --servidor http://192.168.0.10:8000
+
+import argparse
+import json
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime
 
 import cv2
 
+import superlotacao
+from cliente_api import ClienteLotacao
 from detector_passageiros import DetectorPassageiros
 
 LIMITE = 40
@@ -22,9 +38,73 @@ PASSAGEIROS_INICIAIS = 0
 # Sentido da linha: -1 ou 1 (inverta se entrada/saída aparecerem trocadas)
 SENTIDO_ENTRADA = 1
 
+# Envio para o servidor/dashboard (rode `servidor.py` para ver no navegador)
+URL_SERVIDOR = "http://127.0.0.1:8000"
+INTERVALO_ENVIO = 10.0  # segundos entre leituras de batimento
 
-def check_limite(passageiros, limite=LIMITE):
-    return passageiros >= limite
+
+def listar_onibus(url):
+    """Consulta o cadastro de ônibus no servidor (GET /api/onibus)."""
+    endereco = url.rstrip("/") + "/api/onibus"
+    try:
+        with urllib.request.urlopen(endereco, timeout=5) as resposta:
+            dados = json.load(resposta)
+    except (urllib.error.URLError, OSError, json.JSONDecodeError) as erro:
+        raise ConnectionError(
+            f"não foi possível consultar {endereco}: {erro}"
+        ) from erro
+
+    return dados.get("onibus") or []
+
+
+def selecionar_onibus(url, nome=None):
+    """Escolhe um ônibus do cadastro do servidor.
+
+    Com `nome`, valida que ele está cadastrado. Sem `nome`, mostra a lista e
+    pede a escolha pelo número ou pelo nome.
+    """
+    lista = listar_onibus(url)
+    if not lista:
+        raise SystemExit(
+            "Nenhum ônibus cadastrado. Cadastre um no dashboard "
+            f"({url.rstrip('/')}/) ou via "
+            'POST /api/onibus {"nome": "onibus-01", "linha": "101"}.'
+        )
+
+    if nome:
+        for item in lista:
+            if item["onibus"] == nome:
+                return item
+        disponiveis = ", ".join(item["onibus"] for item in lista)
+        raise SystemExit(
+            f"Ônibus '{nome}' não está cadastrado. Disponíveis: {disponiveis}."
+        )
+
+    print("Ônibus cadastrados:")
+    for indice, item in enumerate(lista, start=1):
+        linha = f" — {item['linha']}" if item.get("linha") else ""
+        estado = "desconectado" if item.get("obsoleto") else "conectado"
+        print(f"  {indice}) {item['onibus']}{linha} · {estado}")
+
+    while True:
+        try:
+            escolha = input("Selecione o ônibus deste computador: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            raise SystemExit("\nSeleção cancelada.") from None
+
+        if not escolha:
+            continue
+
+        if escolha.isdigit():
+            indice = int(escolha)
+            if 1 <= indice <= len(lista):
+                return lista[indice - 1]
+
+        for item in lista:
+            if item["onibus"] == escolha:
+                return item
+
+        print("Opção inválida. Digite o número ou o nome exato do ônibus.")
 
 
 def atualizar_passageiros(passageiros, situacao):
@@ -56,7 +136,7 @@ def detectar_saida(saidas):
     return saidas > 0
 
 
-def desenhar_painel(frame, passageiros, parado, portas_abertas, lotado):
+def desenhar_painel(frame, passageiros, parado, portas_abertas, classificacao):
     if not check_parada(parado):
         status = "EM MOVIMENTO"
         cor = (0, 255, 255)
@@ -79,7 +159,8 @@ def desenhar_painel(frame, passageiros, parado, portas_abertas, lotado):
 
     cv2.putText(
         frame,
-        f"Passageiros: {passageiros}/{LIMITE}",
+        f"Passageiros: {passageiros}/{classificacao['capacidade']}"
+        f" ({classificacao['percentual']}%)",
         (20, 75),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.9,
@@ -87,16 +168,19 @@ def desenhar_painel(frame, passageiros, parado, portas_abertas, lotado):
         2
     )
 
-    if lotado:
-        cv2.putText(
-            frame,
-            "LOTADO",
-            (20, 115),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.9,
-            (0, 0, 255),
-            2
-        )
+    rotulo = classificacao["rotulo"]
+    if superlotacao.em_alerta(classificacao["nivel"]):
+        rotulo += " !!"
+
+    cv2.putText(
+        frame,
+        f"Lotacao: {rotulo}",
+        (20, 115),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.9,
+        superlotacao.CORES_BGR[classificacao["nivel"]],
+        2
+    )
 
     cv2.putText(
         frame,
@@ -110,6 +194,35 @@ def desenhar_painel(frame, passageiros, parado, portas_abertas, lotado):
 
 
 def main():
+    analisador = argparse.ArgumentParser(
+        description="Simulação de ônibus com contagem de passageiros."
+    )
+    analisador.add_argument(
+        "--onibus",
+        help="nome de um ônibus já cadastrado (pula a seleção interativa)",
+    )
+    analisador.add_argument(
+        "--servidor",
+        default=URL_SERVIDOR,
+        help=f"URL do servidor/dashboard (padrão: {URL_SERVIDOR})",
+    )
+    argumentos = analisador.parse_args()
+
+    try:
+        escolhido = selecionar_onibus(argumentos.servidor, argumentos.onibus)
+    except ConnectionError as erro:
+        raise SystemExit(
+            "Servidor indisponível. Inicie `.venv/bin/python servidor.py` "
+            f"antes do busScript.\nDetalhe: {erro}"
+        ) from erro
+
+    id_onibus = escolhido["onibus"]
+    linha = escolhido.get("linha") or ""
+    print(
+        f"Ônibus selecionado: {id_onibus}"
+        + (f" — {linha}" if linha else "")
+    )
+
     cap = cv2.VideoCapture(0)
 
     if not cap.isOpened():
@@ -117,11 +230,16 @@ def main():
         return
 
     detector = DetectorPassageiros(lado_entrada=SENTIDO_ENTRADA)
+    cliente = ClienteLotacao(argumentos.servidor, id_onibus)
+    viagem = datetime.now().strftime("%Y%m%d-%H%M%S")
 
     passageiros = PASSAGEIROS_INICIAIS
     parado = False
     portas_abertas = False
-    lotado_anterior = False
+    alerta_anterior = None
+    assinatura_enviada = None
+    ultimo_envio = 0.0
+    pico = passageiros
 
     while True:
         ret, frame = cap.read()
@@ -172,24 +290,41 @@ def main():
             annotated = frame
             detector.desenhar_linha(annotated)
 
-        lotado = check_limite(passageiros, LIMITE)
+        classificacao = superlotacao.classificar(passageiros, LIMITE)
+        nivel = classificacao["nivel"]
+        pico = max(pico, passageiros)
 
-        if lotado and not lotado_anterior:
-            print("Ônibus lotado!")
+        if superlotacao.em_alerta(nivel) and nivel != alerta_anterior:
+            print(
+                f"Alerta: {classificacao['rotulo']} - "
+                f"{passageiros}/{LIMITE} ({classificacao['percentual']}%)"
+            )
+        alerta_anterior = nivel
 
-        lotado_anterior = lotado
+        # Publica a cada mudança e também como batimento enquanto o app roda
+        agora = time.monotonic()
+        assinatura = (nivel, passageiros)
+        if assinatura != assinatura_enviada or agora - ultimo_envio >= INTERVALO_ENVIO:
+            cliente.enviar(passageiros, LIMITE, viagem=viagem, linha=linha)
+            assinatura_enviada = assinatura
+            ultimo_envio = agora
 
-        desenhar_painel(annotated, passageiros, parado, portas_abertas, lotado)
+        desenhar_painel(
+            annotated, passageiros, parado, portas_abertas, classificacao
+        )
 
         cv2.imshow("Simulacao Onibus", annotated)
 
     cap.release()
     cv2.destroyAllWindows()
+    cliente.fechar()
 
     print("\n--- RESUMO DA VIAGEM ---")
     print(f"Entradas: {detector.entradas}")
     print(f"Saídas: {detector.saidas}")
     print(f"Passageiros no ônibus: {passageiros}")
+    print(f"Pico de passageiros: {pico}/{LIMITE}")
+    print(f"Leituras enviadas: {cliente.enviados} | falhas: {cliente.falhas}")
 
 
 if __name__ == "__main__":

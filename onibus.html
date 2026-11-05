@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+    <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>BUS CHECK — Gerenciar ônibus</title>
+        <link rel="stylesheet" href="/estilo.css">
+    </head>
+    <body>
+        <header class="topo">
+            <div class="marca">
+                <h1>GERENCIAR ÔNIBUS</h1>
+                <p>Cadastre, altere ou remova os ônibus monitorados</p>
+            </div>
+            <div class="controles">
+                <a class="link-pagina" href="/">Voltar ao dashboard</a>
+            </div>
+        </header>
+
+        <main class="pagina-cadastro">
+            <section class="gerenciar">
+                <h2>Cadastro</h2>
+                <p class="legenda">
+                    Cadastre, altere ou remova ônibus. Remover do cadastro não apaga
+                    o histórico de leituras já registrado.
+                </p>
+
+                <form id="form-onibus" class="gerenciar-form">
+                    <label>Nome
+                        <input id="onibus-nome" type="text" maxlength="60" required
+                               placeholder="onibus-01" autocomplete="off">
+                    </label>
+                    <label>Linha
+                        <input id="onibus-linha" type="text" maxlength="60"
+                               placeholder="101" autocomplete="off">
+                    </label>
+                    <button type="submit" class="botao" id="onibus-salvar">Cadastrar</button>
+                    <button type="button" class="botao secundario" id="onibus-cancelar" hidden>
+                        Cancelar edição
+                    </button>
+                </form>
+
+                <p id="onibus-mensagem" class="mensagem" role="status"></p>
+                <ul id="lista-onibus" class="gerenciar-lista"></ul>
+            </section>
+        </main>
+
+        <script>
+            const INTERVALO_ATUALIZACAO = 5000;
+
+            let listaAtual = [];
+            let onibusEmEdicao = null;
+
+            function escaparHtml(valor) {
+                return String(valor ?? "").replace(
+                    /[&<>"']/g,
+                    (caractere) =>
+                        ({
+                            "&": "&amp;",
+                            "<": "&lt;",
+                            ">": "&gt;",
+                            '"': "&quot;",
+                            "'": "&#39;",
+                        })[caractere]
+                );
+            }
+
+            function mensagem(texto, tipo = "") {
+                const elemento = document.getElementById("onibus-mensagem");
+                elemento.textContent = texto;
+                elemento.className = `mensagem${tipo ? ` ${tipo}` : ""}`;
+            }
+
+            async function buscarLista() {
+                const resposta = await fetch("/api/onibus", { cache: "no-store" });
+                if (!resposta.ok) throw new Error(`HTTP ${resposta.status}`);
+                const dados = await resposta.json();
+                listaAtual = dados.onibus || [];
+                renderizar();
+            }
+
+            async function enviarJson(metodo, url, dados = null) {
+                const opcoes = { method: metodo, cache: "no-store", headers: {} };
+                if (dados !== null) {
+                    opcoes.headers["Content-Type"] = "application/json";
+                    opcoes.body = JSON.stringify(dados);
+                }
+
+                const resposta = await fetch(url, opcoes);
+                let corpo = null;
+                try {
+                    corpo = await resposta.json();
+                } catch (erro) {
+                    corpo = null;
+                }
+
+                if (!resposta.ok) {
+                    throw new Error(
+                        (corpo && corpo.erro) || `HTTP ${resposta.status}`
+                    );
+                }
+                return corpo;
+            }
+
+            function renderizar() {
+                const elemento = document.getElementById("lista-onibus");
+
+                if (listaAtual.length === 0) {
+                    elemento.innerHTML =
+                        '<li class="vazio-texto">Nenhum ônibus cadastrado.</li>';
+                    return;
+                }
+
+                elemento.innerHTML = listaAtual
+                    .map((item) => {
+                        const nome = escaparHtml(item.onibus);
+                        const linha = item.linha
+                            ? `Linha ${escaparHtml(item.linha)}`
+                            : "sem linha";
+                        const estado = item.obsoleto
+                            ? "desconectado"
+                            : "conectado";
+                        const leituras =
+                            item.leituras === 1
+                                ? "1 leitura"
+                                : `${item.leituras} leituras`;
+                        return `
+                        <li>
+                            <span class="nome">${nome}</span>
+                            <span class="detalhe">${linha} · ${leituras} · ${estado}</span>
+                            <span class="acoes">
+                                <button type="button" class="botao secundario"
+                                        data-acao="editar" data-onibus="${nome}">Editar</button>
+                                <button type="button" class="botao perigo"
+                                        data-acao="excluir" data-onibus="${nome}">Excluir</button>
+                            </span>
+                        </li>`;
+                    })
+                    .join("");
+            }
+
+            function iniciarEdicao(nome) {
+                const item = listaAtual.find((onibus) => onibus.onibus === nome);
+                if (!item) return;
+
+                onibusEmEdicao = nome;
+                document.getElementById("onibus-nome").value = item.onibus;
+                document.getElementById("onibus-linha").value = item.linha || "";
+                document.getElementById("onibus-salvar").textContent =
+                    "Salvar alterações";
+                document.getElementById("onibus-cancelar").hidden = false;
+                document.getElementById("onibus-nome").focus();
+                mensagem(`Editando “${nome}”.`);
+            }
+
+            function cancelarEdicao() {
+                onibusEmEdicao = null;
+                document.getElementById("form-onibus").reset();
+                document.getElementById("onibus-salvar").textContent = "Cadastrar";
+                document.getElementById("onibus-cancelar").hidden = true;
+            }
+
+            async function salvar(evento) {
+                evento.preventDefault();
+
+                const nome = document.getElementById("onibus-nome").value.trim();
+                const linha = document.getElementById("onibus-linha").value.trim();
+                if (!nome) {
+                    mensagem("Informe o nome do ônibus.", "erro");
+                    return;
+                }
+
+                const botao = document.getElementById("onibus-salvar");
+                botao.disabled = true;
+                try {
+                    if (onibusEmEdicao) {
+                        const resposta = await enviarJson(
+                            "PUT",
+                            `/api/onibus/${encodeURIComponent(onibusEmEdicao)}`,
+                            { nome, linha }
+                        );
+                        cancelarEdicao();
+                        mensagem(
+                            `Ônibus “${resposta.onibus}” atualizado.`,
+                            "ok"
+                        );
+                    } else {
+                        const resposta = await enviarJson("POST", "/api/onibus", {
+                            nome,
+                            linha,
+                        });
+                        cancelarEdicao();
+                        mensagem(
+                            `Ônibus “${resposta.onibus}” cadastrado.`,
+                            "ok"
+                        );
+                    }
+
+                    await buscarLista();
+                } catch (erro) {
+                    mensagem(
+                        erro.message || "Não foi possível salvar o ônibus.",
+                        "erro"
+                    );
+                } finally {
+                    botao.disabled = false;
+                }
+            }
+
+            async function excluir(nome) {
+                if (
+                    !confirm(
+                        `Excluir o cadastro do ônibus “${nome}”?\n` +
+                            "O histórico de leituras será mantido."
+                    )
+                ) {
+                    return;
+                }
+
+                try {
+                    const resposta = await enviarJson(
+                        "DELETE",
+                        `/api/onibus/${encodeURIComponent(nome)}`
+                    );
+                    if (onibusEmEdicao === nome) cancelarEdicao();
+                    await buscarLista();
+                    mensagem(
+                        `Ônibus “${resposta.onibus}” removido do cadastro.`,
+                        "ok"
+                    );
+                } catch (erro) {
+                    mensagem(
+                        erro.message || "Não foi possível excluir o ônibus.",
+                        "erro"
+                    );
+                }
+            }
+
+            async function atualizar() {
+                try {
+                    await buscarLista();
+                } catch (erro) {
+                    console.error(erro);
+                    mensagem("Servidor desconectado. Tentando novamente…", "erro");
+                }
+            }
+
+            function iniciar() {
+                document
+                    .getElementById("form-onibus")
+                    .addEventListener("submit", salvar);
+
+                document
+                    .getElementById("onibus-cancelar")
+                    .addEventListener("click", () => {
+                        cancelarEdicao();
+                        mensagem("");
+                    });
+
+                document
+                    .getElementById("lista-onibus")
+                    .addEventListener("click", (evento) => {
+                        const botao = evento.target.closest("button[data-acao]");
+                        if (!botao) return;
+
+                        const nome = botao.dataset.onibus;
+                        if (botao.dataset.acao === "editar") {
+                            iniciarEdicao(nome);
+                        } else if (botao.dataset.acao === "excluir") {
+                            excluir(nome);
+                        }
+                    });
+
+                atualizar();
+                setInterval(atualizar, INTERVALO_ATUALIZACAO);
+            }
+
+            document.addEventListener("DOMContentLoaded", iniciar);
+        </script>
+    </body>
+</html>

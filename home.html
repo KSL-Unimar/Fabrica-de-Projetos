@@ -1,14 +1,500 @@
 <!DOCTYPE html>
-<html>
+<html lang="pt-BR">
     <head>
         <meta charset="utf-8">
-        <meta http-equiv="X-UA-Compatible" content="IE=edge">
-        <title>BUS CHECK</title>
-        <meta name="description" content="">
         <meta name="viewport" content="width=device-width, initial-scale=1">
-        <link rel="stylesheet" href="">
+        <title>BUS CHECK — Lotação</title>
+        <link rel="stylesheet" href="/estilo.css">
     </head>
     <body>
-        <h1>Test</h1>
+        <header class="topo">
+            <div class="marca">
+                <h1>BUS CHECK</h1>
+                <p>Monitoramento de lotação do ônibus em tempo real</p>
+            </div>
+            <div class="controles">
+                <label>Ônibus
+                    <select id="onibus"></select>
+                </label>
+                <label>Data
+                    <input type="date" id="data">
+                </label>
+                <span id="conexao" class="conexao">conectado</span>
+                <a class="link-pagina" href="/onibus">Gerenciar ônibus</a>
+            </div>
+        </header>
+
+        <section id="alerta" class="alerta vazio" aria-live="polite">
+            <div class="rotulo" id="alerta-rotulo">SEM LEITURAS</div>
+            <div class="numeros" id="alerta-numeros">—</div>
+            <div class="detalhe" id="alerta-detalhe">
+                Rode <code>servidor.py</code> e depois <code>busScript.py</code> para começar.
+            </div>
+        </section>
+
+        <section class="cartoes">
+            <article class="cartao">
+                <span>Passageiros agora</span>
+                <strong id="cartao-atual">—</strong>
+                <small id="cartao-atual-detalhe">sem leitura</small>
+            </article>
+            <article class="cartao">
+                <span>Pico do dia</span>
+                <strong id="cartao-pico">—</strong>
+                <small id="cartao-pico-detalhe">sem leitura</small>
+            </article>
+            <article class="cartao">
+                <span>Média do dia</span>
+                <strong id="cartao-media">—</strong>
+                <small>ocupação média</small>
+            </article>
+            <article class="cartao">
+                <span>Alertas</span>
+                <strong id="cartao-alertas">—</strong>
+                <small>entradas em lotado/superlotado</small>
+            </article>
+        </section>
+
+        <section class="grafico">
+            <div class="grafico-topo">
+                <h2>Ocupação do dia</h2>
+                <span class="legenda">% da capacidade · picos por intervalo · linhas em 70% / 100% / 120%</span>
+            </div>
+            <canvas id="grafico"></canvas>
+        </section>
+
+        <section class="listas">
+            <div class="bloco">
+                <h2>Alertas do dia</h2>
+                <ul id="alertas" class="alertas"></ul>
+            </div>
+            <div class="bloco">
+                <h2>Histórico</h2>
+                <div class="tabela-wrapper">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Hora</th>
+                                <th>Ônibus</th>
+                                <th>Linha</th>
+                                <th>Passageiros</th>
+                                <th>Ocupação</th>
+                                <th>Nível</th>
+                            </tr>
+                        </thead>
+                        <tbody id="historico"></tbody>
+                    </table>
+                </div>
+            </div>
+        </section>
+
+        <script>
+            const CORES = {
+                normal: "#22c55e",
+                atencao: "#eab308",
+                lotado: "#f97316",
+                superlotado: "#ef4444",
+            };
+            const ROTULOS = {
+                normal: "NORMAL",
+                atencao: "ATENÇÃO",
+                lotado: "LOTADO",
+                superlotado: "SUPERLOTADO",
+            };
+            const LIMIARES = [70, 100, 120];
+            const INTERVALO_ATUALIZACAO = 3000;
+
+            let onibusAtual = null;
+            let dataAtual = hoje();
+            let ultimaSerie = [];
+            let assinaturaOnibus = "";
+
+            function hoje() {
+                const agora = new Date();
+                const local = new Date(agora.getTime() - agora.getTimezoneOffset() * 60000);
+                return local.toISOString().slice(0, 10);
+            }
+
+            function buscar(url) {
+                return fetch(url, { cache: "no-store" }).then((resposta) => {
+                    if (!resposta.ok) throw new Error(`HTTP ${resposta.status}`);
+                    return resposta.json();
+                });
+            }
+
+            function texto(seletor, valor) {
+                document.querySelector(seletor).textContent = valor;
+            }
+
+            function escaparHtml(valor) {
+                return String(valor ?? "").replace(
+                    /[&<>"']/g,
+                    (caractere) =>
+                        ({
+                            "&": "&amp;",
+                            "<": "&lt;",
+                            ">": "&gt;",
+                            '"': "&quot;",
+                            "'": "&#39;",
+                        })[caractere]
+                );
+            }
+
+            function formatarIdade(segundos) {
+                if (segundos < 60) return `${segundos}s`;
+                if (segundos < 3600) return `${Math.floor(segundos / 60)}min`;
+                return `${Math.floor(segundos / 3600)}h`;
+            }
+
+            function rotuloOnibus(item) {
+                const linhas = (item.linhas || "")
+                    .split(",")
+                    .map((linha) => linha.trim())
+                    .filter(Boolean);
+                const identificacao = linhas.length
+                    ? `${item.onibus} — ${linhas.join(", ")}`
+                    : item.onibus;
+                return `${identificacao} · ${item.obsoleto ? "desconectado" : "conectado"}`;
+            }
+
+            async function carregarOnibus() {
+                const dados = await buscar("/api/onibus");
+                const lista = dados.onibus || [];
+
+                const assinatura = lista
+                    .map(
+                        (item) =>
+                            `${item.onibus}|${item.linhas || ""}|${item.obsoleto ? "1" : "0"}`
+                    )
+                    .sort()
+                    .join(";");
+                const select = document.getElementById("onibus");
+
+                // Só reconstrói o select quando a lista de ônibus/linhas muda
+                if (assinatura === assinaturaOnibus && select.options.length > 0) {
+                    return;
+                }
+                assinaturaOnibus = assinatura;
+
+                const nomes = lista.map((item) => item.onibus);
+                select.innerHTML = "";
+
+                if (nomes.length === 0) {
+                    const vazio = document.createElement("option");
+                    vazio.value = "";
+                    vazio.textContent = "sem ônibus cadastrado";
+                    select.appendChild(vazio);
+                    onibusAtual = null;
+                    return;
+                }
+
+                for (const item of lista) {
+                    const opcao = document.createElement("option");
+                    opcao.value = item.onibus;
+                    opcao.textContent = rotuloOnibus(item);
+                    select.appendChild(opcao);
+                }
+
+                if (!onibusAtual || !nomes.includes(onibusAtual)) {
+                    onibusAtual = nomes[0];
+                }
+                select.value = onibusAtual;
+            }
+
+            function renderizarEstado(estado) {
+                const banner = document.getElementById("alerta");
+                const rotulo = document.getElementById("alerta-rotulo");
+                const numeros = document.getElementById("alerta-numeros");
+                const detalhe = document.getElementById("alerta-detalhe");
+
+                if (!estado || estado.vazio) {
+                    banner.className = "alerta vazio";
+                    rotulo.textContent = "SEM LEITURAS";
+                    numeros.textContent = "—";
+                    detalhe.textContent =
+                        "Rode servidor.py e depois busScript.py para começar.";
+                    return;
+                }
+
+                const classe = estado.obsoleto ? "obsoleto" : estado.nivel;
+                banner.className = `alerta ${classe}`;
+                rotulo.textContent = estado.obsoleto
+                    ? "DESCONECTADO"
+                    : ROTULOS[estado.nivel] || estado.nivel.toUpperCase();
+                numeros.textContent = `${estado.passageiros}/${estado.capacidade} · ${estado.percentual}%`;
+                const origem = estado.linha
+                    ? `${estado.onibus} · ${estado.linha}`
+                    : estado.onibus;
+                detalhe.textContent = estado.obsoleto
+                    ? `Última leitura de ${origem} há ${formatarIdade(estado.idade_segundos)} — verifique o busScript.py.`
+                    : `Atualizado há ${formatarIdade(estado.idade_segundos)} · ${estado.hora} · ${origem}`;
+
+                texto("#cartao-atual", `${estado.passageiros}/${estado.capacidade}`);
+                texto(
+                    "#cartao-atual-detalhe",
+                    `${estado.percentual}% · ${ROTULOS[estado.nivel] || estado.nivel}`
+                );
+            }
+
+            function renderizarHistorico(historico) {
+                const resumo = historico.resumo;
+                const alertas = historico.alertas || [];
+                const leituras = historico.leituras || [];
+
+                if (!resumo) {
+                    texto("#cartao-pico", "—");
+                    texto("#cartao-pico-detalhe", "sem leitura neste dia");
+                    texto("#cartao-media", "—");
+                    texto("#cartao-alertas", "0");
+                    ultimaSerie = [];
+                    desenharGrafico([]);
+                    document.getElementById("alertas").innerHTML =
+                        '<li class="vazio-texto">Nenhum alerta neste dia.</li>';
+                    document.getElementById("historico").innerHTML =
+                        '<tr><td colspan="6" class="vazio-texto">Sem leituras neste dia.</td></tr>';
+                    return;
+                }
+
+                texto("#cartao-pico", `${resumo.pico}/${resumo.capacidade}`);
+                texto(
+                    "#cartao-pico-detalhe",
+                    `${resumo.pico_percentual}% · ${resumo.pico_hora} · ${ROTULOS[resumo.pico_nivel] || resumo.pico_nivel}`
+                );
+                texto("#cartao-media", `${resumo.media_percentual}%`);
+                texto("#cartao-alertas", String(alertas.length));
+
+                ultimaSerie = historico.serie || [];
+                desenharGrafico(ultimaSerie);
+
+                const listaAlertas = document.getElementById("alertas");
+                if (alertas.length === 0) {
+                    listaAlertas.innerHTML =
+                        '<li class="vazio-texto">Nenhum alerta neste dia.</li>';
+                } else {
+                    listaAlertas.innerHTML = alertas
+                        .slice()
+                        .reverse()
+                        .map(
+                            (alerta) => `
+                            <li class="${alerta.nivel}">
+                                <span class="hora">${alerta.hora}</span>
+                                <span class="nivel">${alerta.rotulo}</span>
+                                <span class="origem">${escaparHtml(alerta.onibus || "—")}${alerta.linha ? " · " + escaparHtml(alerta.linha) : ""}</span>
+                                <span class="contagem">${alerta.passageiros}/${alerta.capacidade} · ${alerta.percentual}%</span>
+                            </li>`
+                        )
+                        .join("");
+                }
+
+                const corpo = document.getElementById("historico");
+                if (leituras.length === 0) {
+                    corpo.innerHTML =
+                        '<tr><td colspan="6" class="vazio-texto">Sem leituras neste dia.</td></tr>';
+                } else {
+                    corpo.innerHTML = leituras
+                        .slice()
+                        .reverse()
+                        .map(
+                            (leitura) => `
+                            <tr>
+                                <td>${leitura.hora}</td>
+                                <td>${escaparHtml(leitura.onibus || "—")}</td>
+                                <td>${escaparHtml(leitura.linha || "—")}</td>
+                                <td>${leitura.passageiros}/${leitura.capacidade}</td>
+                                <td>${leitura.percentual}%</td>
+                                <td><span class="selo ${leitura.nivel}">${ROTULOS[leitura.nivel] || leitura.nivel}</span></td>
+                            </tr>`
+                        )
+                        .join("");
+                }
+            }
+
+            function desenharGrafico(serie) {
+                const canvas = document.getElementById("grafico");
+                const caixa = canvas.getBoundingClientRect();
+                const dpr = window.devicePixelRatio || 1;
+
+                canvas.width = Math.max(1, Math.round(caixa.width * dpr));
+                canvas.height = Math.max(1, Math.round(caixa.height * dpr));
+
+                const ctx = canvas.getContext("2d");
+                ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+                ctx.clearRect(0, 0, caixa.width, caixa.height);
+
+                const largura = caixa.width;
+                const altura = caixa.height;
+                const margem = { topo: 14, direita: 14, baixo: 26, esquerda: 46 };
+                const areaL = largura - margem.esquerda - margem.direita;
+                const areaA = altura - margem.topo - margem.baixo;
+
+                if (serie.length === 0) {
+                    ctx.fillStyle = "#8fa3c7";
+                    ctx.font = "14px system-ui, sans-serif";
+                    ctx.textAlign = "center";
+                    ctx.fillText("Sem leituras para este dia", largura / 2, altura / 2);
+                    return;
+                }
+
+                const percentuais = serie.map((ponto) => ponto.percentual);
+                const maximoBruto = Math.max(...percentuais, ...LIMIARES);
+                const maxY = Math.ceil((maximoBruto + 5) / 25) * 25;
+
+                const x = (indice) =>
+                    margem.esquerda +
+                    (serie.length === 1 ? areaL / 2 : (indice / (serie.length - 1)) * areaL);
+                const y = (valor) =>
+                    margem.topo + areaA - (Math.min(valor, maxY) / maxY) * areaA;
+
+                ctx.font = "11px system-ui, sans-serif";
+                ctx.textAlign = "right";
+                ctx.textBaseline = "middle";
+
+                for (let valor = 0; valor <= maxY; valor += 25) {
+                    const linhaY = y(valor);
+                    ctx.strokeStyle = "rgba(143, 163, 199, .12)";
+                    ctx.lineWidth = 1;
+                    ctx.beginPath();
+                    ctx.moveTo(margem.esquerda, linhaY);
+                    ctx.lineTo(largura - margem.direita, linhaY);
+                    ctx.stroke();
+
+                    ctx.fillStyle = "#8fa3c7";
+                    ctx.fillText(`${valor}%`, margem.esquerda - 8, linhaY);
+                }
+
+                const coresLimiar = { 70: "#eab308", 100: "#f97316", 120: "#ef4444" };
+                ctx.textAlign = "left";
+                ctx.textBaseline = "bottom";
+                for (const limiar of LIMIARES) {
+                    if (limiar > maxY) continue;
+                    const linhaY = y(limiar);
+                    ctx.strokeStyle = coresLimiar[limiar];
+                    ctx.globalAlpha = 0.55;
+                    ctx.setLineDash([6, 6]);
+                    ctx.lineWidth = 1;
+                    ctx.beginPath();
+                    ctx.moveTo(margem.esquerda, linhaY);
+                    ctx.lineTo(largura - margem.direita, linhaY);
+                    ctx.stroke();
+                    ctx.setLineDash([]);
+                    ctx.globalAlpha = 0.9;
+                    ctx.fillStyle = coresLimiar[limiar];
+                    ctx.fillText(`${limiar}%`, margem.esquerda + 4, linhaY - 2);
+                }
+                ctx.globalAlpha = 1;
+
+                const nivelAtual = serie[serie.length - 1].nivel || "normal";
+                const cor = CORES[nivelAtual] || "#38bdf8";
+
+                const caminho = new Path2D();
+                caminho.moveTo(x(0), y(serie[0].percentual));
+                for (let i = 1; i < serie.length; i += 1) {
+                    caminho.lineTo(x(i), y(serie[i - 1].percentual));
+                    caminho.lineTo(x(i), y(serie[i].percentual));
+                }
+
+                const area = new Path2D(caminho);
+                area.lineTo(x(serie.length - 1), y(0));
+                area.lineTo(x(0), y(0));
+                area.closePath();
+
+                const gradiente = ctx.createLinearGradient(0, margem.topo, 0, altura - margem.baixo);
+                gradiente.addColorStop(0, `${cor}55`);
+                gradiente.addColorStop(1, `${cor}05`);
+                ctx.fillStyle = gradiente;
+                ctx.fill(area);
+
+                ctx.strokeStyle = cor;
+                ctx.lineWidth = 2.5;
+                ctx.lineJoin = "round";
+                ctx.stroke(caminho);
+
+                ctx.textAlign = "center";
+                ctx.textBaseline = "top";
+                ctx.fillStyle = "#8fa3c7";
+                const marcas = Math.min(6, serie.length);
+                for (let i = 0; i < marcas; i += 1) {
+                    const indice =
+                        marcas === 1 ? 0 : Math.round((i / (marcas - 1)) * (serie.length - 1));
+                    const hora = (serie[indice].hora || "").slice(0, 5);
+                    ctx.fillText(hora, x(indice), altura - margem.baixo + 8);
+                }
+            }
+
+            function marcarConexao(conectado, estado = null) {
+                const elemento = document.getElementById("conexao");
+                const semLeitura = !estado || estado.vazio;
+                const desconectado = !conectado || semLeitura || estado.obsoleto;
+                elemento.classList.toggle("offline", desconectado);
+
+                if (!conectado) {
+                    elemento.textContent = "servidor desconectado";
+                } else if (semLeitura) {
+                    elemento.textContent = "sem leituras";
+                } else if (estado.obsoleto) {
+                    elemento.textContent = "ônibus desconectado";
+                } else {
+                    elemento.textContent = "ônibus conectado";
+                }
+            }
+
+            async function atualizarTudo() {
+                try {
+                    await carregarOnibus();
+
+                    const estado = await buscar(
+                        `/api/estado${onibusAtual ? `?onibus=${encodeURIComponent(onibusAtual)}` : ""}`
+                    );
+
+                    if (!onibusAtual && estado.onibus) {
+                        onibusAtual = estado.onibus;
+                    }
+
+                    const historico = await buscar(
+                        `/api/historico?data=${encodeURIComponent(dataAtual)}` +
+                            (onibusAtual ? `&onibus=${encodeURIComponent(onibusAtual)}` : "")
+                    );
+
+                    if (!onibusAtual && historico.onibus) {
+                        onibusAtual = historico.onibus;
+                        await carregarOnibus();
+                    }
+
+                    renderizarEstado(estado);
+                    renderizarHistorico(historico);
+                    marcarConexao(true, estado);
+                } catch (erro) {
+                    console.error(erro);
+                    marcarConexao(false);
+                }
+            }
+
+            async function iniciar() {
+                document.getElementById("data").value = dataAtual;
+
+                document.getElementById("data").addEventListener("change", (evento) => {
+                    dataAtual = evento.target.value || hoje();
+                    atualizarTudo();
+                });
+
+                document.getElementById("onibus").addEventListener("change", (evento) => {
+                    onibusAtual = evento.target.value || null;
+                    atualizarTudo();
+                });
+
+                window.addEventListener("resize", () => desenharGrafico(ultimaSerie));
+
+                try {
+                    await carregarOnibus();
+                } catch (erro) {
+                    console.error(erro);
+                }
+
+                await atualizarTudo();
+                setInterval(atualizarTudo, INTERVALO_ATUALIZACAO);
+            }
+
+            document.addEventListener("DOMContentLoaded", iniciar);
+        </script>
     </body>
 </html>
